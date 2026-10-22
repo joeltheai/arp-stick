@@ -18,6 +18,20 @@ pub fn build(b: *std.Build) void {
     } else {
         b.getInstallStep().dependOn(&b.addInstallFile(lib.getEmittedBin(), "ArpStick.clap").step);
     }
+    if (target.result.os.tag == .macos) {
+        const preview_module = b.createModule(.{
+            .root_source_file = b.path("src/preview.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        preview_module.addIncludePath(b.path("src"));
+        addNativeUI(b, preview_module);
+        const preview = b.addExecutable(.{ .name = "arp-stick-preview", .root_module = preview_module });
+        const run_preview = b.addRunArtifact(preview);
+        if (b.args) |args| run_preview.addArgs(args);
+        b.step("preview", "Open the standalone UI preview (no DAW, no audio)").dependOn(&run_preview.step);
+    }
     const unit_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/engine.zig"),
         .target = target,
@@ -38,4 +52,11 @@ pub fn build(b: *std.Build) void {
         run.addArtifactArg(lib);
         test_step.dependOn(&run.step);
     }
+}
+
+fn addNativeUI(b: *std.Build, module: *std.Build.Module) void {
+    module.addCSourceFile(.{ .file = b.path("src/ui/macos.m"), .flags = &.{ "-fobjc-arc", "-Wall", "-Wextra" } });
+    module.linkFramework("Cocoa", .{});
+    module.linkFramework("QuartzCore", .{});
+    module.linkSystemLibrary("objc", .{});
 }
