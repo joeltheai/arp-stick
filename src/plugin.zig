@@ -1,5 +1,7 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const engine = @import("engine.zig");
+const ui = @import("ui.zig");
 const c = @cImport({
     @cInclude("clap/clap.h");
 });
@@ -24,6 +26,12 @@ const Instance = struct {
     values: [4]std.atomic.Value(u8),
     arp: engine.Engine = .{},
     was_playing: bool = false,
+    editor: ?*anyopaque = null,
+    // Single producer (GUI/main thread), single consumer (process/flush). No locks on the audio thread.
+    gui_changes: [32]struct { id: u32, value: u32 } = undefined,
+    gui_write: std.atomic.Value(u32) = .init(0),
+    gui_read: std.atomic.Value(u32) = .init(0),
+    gui_phase: u2 = 0,
 
     fn get(plugin: [*c]const c.clap_plugin_t) *Instance {
         return @ptrCast(@alignCast(plugin.*.plugin_data.?));
@@ -52,6 +60,7 @@ fn init(_: [*c]const c.clap_plugin_t) callconv(.c) bool {
     return true;
 }
 fn destroy(plugin: [*c]const c.clap_plugin_t) callconv(.c) void {
+    guiDestroy(plugin);
     std.heap.c_allocator.destroy(Instance.get(plugin));
 }
 fn activate(plugin: [*c]const c.clap_plugin_t, sample_rate: f64, _: u32, _: u32) callconv(.c) bool {
@@ -126,6 +135,7 @@ fn process(plugin: [*c]const c.clap_plugin_t, block: [*c]const c.clap_process_t)
         }
     }
     if (p.out_events == null) return c.CLAP_PROCESS_ERROR;
+    emitGuiChanges(self, p.out_events);
     var output: Output = .{ .events = p.out_events };
     const sink: engine.Sink = .{ .context = &output, .push = Output.push };
     transport(self, p.transport);
@@ -231,12 +241,144 @@ fn textValue(_: [*c]const c.clap_plugin_t, id: u32, text: [*c]const u8, value: [
     value.* = @trunc(numeric);
     return true;
 }
-fn flush(plugin: [*c]const c.clap_plugin_t, input: [*c]const c.clap_input_events_t, _: [*c]const c.clap_output_events_t) callconv(.c) void {
+fn flush(plugin: [*c]const c.clap_plugin_t, input: [*c]const c.clap_input_events_t, output: [*c]const c.clap_output_events_t) callconv(.c) void {
+    emitGuiChanges(Instance.get(plugin), output);
     if (input == null) return;
     for (0..input.*.size.?(input)) |i| {
         const header = input.*.get.?(input, @intCast(i));
         if (header != null) parameterEvent(Instance.get(plugin), header);
     }
+}
+
+fn guiRead(context: ?*anyopaque, id: u32) callconv(.c) u32 {
+    if (id >= 4) return 0;
+    const self: *Instance = @ptrCast(@alignCast(context.?));
+    return self.values[id].load(.monotonic);
+}
+fn guiChange(context: ?*anyopaque, id: u32, value: u32) callconv(.c) bool {
+    if (id >= 4 or value > engine.maxima[id]) return false;
+    const self: *Instance = @ptrCast(@alignCast(context.?));
+    const write = self.gui_write.load(.monotonic);
+    if (write -% self.gui_read.load(.acquire) >= self.gui_changes.len) return false;
+    self.gui_changes[write % self.gui_changes.len] = .{ .id = id, .value = value };
+    self.gui_write.store(write +% 1, .release);
+    requestGuiFlush(self);
+    return true;
+}
+fn requestGuiFlush(self: *Instance) void {
+    const raw = self.host.*.get_extension.?(self.host, "clap.params");
+    if (raw) |ptr| {
+        const host_params: *const c.clap_host_params_t = @ptrCast(@alignCast(ptr));
+        host_params.request_flush.?(self.host);
+    } else if (self.host.*.request_process) |request| request(self.host);
+}
+fn onMainThread(plugin: [*c]const c.clap_plugin_t) callconv(.c) void {
+    const self = Instance.get(plugin);
+    if (self.gui_read.load(.acquire) != self.gui_write.load(.acquire)) requestGuiFlush(self);
+}
+fn retryGuiFlush(self: *Instance) void {
+    // request_flush itself is forbidden on the audio thread. Ask the main thread to schedule it.
+    if (self.host.*.request_callback) |request_callback| request_callback(self.host);
+}
+
+// Send UI changes through CLAP with a complete gesture. Resume at the failed event if a host's
+// output list fills, preserving gesture order and retaining the queued value until it is accepted.
+fn emitGuiChanges(self: *Instance, output: [*c]const c.clap_output_events_t) void {
+    if (output == null) return;
+    var drained: usize = 0;
+    while (drained < self.gui_changes.len) : (drained += 1) {
+        const read = self.gui_read.load(.monotonic);
+        if (read == self.gui_write.load(.acquire)) return;
+        const change = self.gui_changes[read % self.gui_changes.len];
+        while (self.gui_phase < 3) : (self.gui_phase += 1) {
+            if (self.gui_phase == 1) {
+                var event = std.mem.zeroes(c.clap_event_param_value_t);
+                event.header = .{ .size = @sizeOf(c.clap_event_param_value_t), .time = 0, .space_id = c.CLAP_CORE_EVENT_SPACE_ID, .type = c.CLAP_EVENT_PARAM_VALUE, .flags = c.CLAP_EVENT_IS_LIVE };
+                event.param_id = change.id;
+                event.note_id = -1;
+                event.port_index = -1;
+                event.channel = -1;
+                event.key = -1;
+                event.value = @floatFromInt(change.value);
+                if (!output.*.try_push.?(output, &event.header)) {
+                    retryGuiFlush(self);
+                    return;
+                }
+                self.set(change.id, event.value);
+            } else {
+                var event: c.clap_event_param_gesture_t = .{
+                    .header = .{ .size = @sizeOf(c.clap_event_param_gesture_t), .time = 0, .space_id = c.CLAP_CORE_EVENT_SPACE_ID, .type = if (self.gui_phase == 0) c.CLAP_EVENT_PARAM_GESTURE_BEGIN else c.CLAP_EVENT_PARAM_GESTURE_END, .flags = c.CLAP_EVENT_IS_LIVE },
+                    .param_id = change.id,
+                };
+                if (!output.*.try_push.?(output, &event.header)) {
+                    retryGuiFlush(self);
+                    return;
+                }
+            }
+        }
+        self.gui_phase = 0;
+        self.gui_read.store(read +% 1, .release);
+    }
+}
+
+fn guiSupported(_: [*c]const c.clap_plugin_t, api: [*c]const u8, floating: bool) callconv(.c) bool {
+    return builtin.os.tag == .macos and !floating and same(api, "cocoa");
+}
+fn guiPreferred(_: [*c]const c.clap_plugin_t, api: [*c][*c]const u8, floating: [*c]bool) callconv(.c) bool {
+    if (builtin.os.tag != .macos or api == null or floating == null) return false;
+    api.* = @ptrCast(&c.CLAP_WINDOW_API_COCOA);
+    floating.* = false;
+    return true;
+}
+fn guiCreate(plugin: [*c]const c.clap_plugin_t, api: [*c]const u8, floating: bool) callconv(.c) bool {
+    const self = Instance.get(plugin);
+    if (!guiSupported(plugin, api, floating) or self.editor != null) return false;
+    const settings = ui.config(self, guiRead, guiChange);
+    self.editor = ui.create(&settings);
+    return self.editor != null;
+}
+fn guiDestroy(plugin: [*c]const c.clap_plugin_t) callconv(.c) void {
+    const self = Instance.get(plugin);
+    ui.destroy(self.editor);
+    self.editor = null;
+}
+fn guiScale(_: [*c]const c.clap_plugin_t, _: f64) callconv(.c) bool {
+    return false;
+} // Cocoa uses logical points.
+fn guiSize(plugin: [*c]const c.clap_plugin_t, width: [*c]u32, height: [*c]u32) callconv(.c) bool {
+    if (Instance.get(plugin).editor == null or width == null or height == null) return false;
+    width.* = 480;
+    height.* = 340;
+    return true;
+}
+fn guiResizable(_: [*c]const c.clap_plugin_t) callconv(.c) bool {
+    return false;
+}
+fn guiHints(_: [*c]const c.clap_plugin_t, _: [*c]c.clap_gui_resize_hints_t) callconv(.c) bool {
+    return false;
+}
+fn guiSetSize(plugin: [*c]const c.clap_plugin_t, width: u32, height: u32) callconv(.c) bool {
+    return Instance.get(plugin).editor != null and width == 480 and height == 340;
+}
+fn guiParent(plugin: [*c]const c.clap_plugin_t, window: [*c]const c.clap_window_t) callconv(.c) bool {
+    if (window == null or !same(window.*.api, "cocoa")) return false;
+    return ui.attach(Instance.get(plugin).editor, window.*.unnamed_0.cocoa);
+}
+fn guiTransient(_: [*c]const c.clap_plugin_t, _: [*c]const c.clap_window_t) callconv(.c) bool {
+    return false;
+}
+fn guiTitle(_: [*c]const c.clap_plugin_t, _: [*c]const u8) callconv(.c) void {}
+fn guiShow(plugin: [*c]const c.clap_plugin_t) callconv(.c) bool {
+    const self = Instance.get(plugin);
+    if (self.editor == null) return false;
+    ui.show(self.editor, true);
+    return true;
+}
+fn guiHide(plugin: [*c]const c.clap_plugin_t) callconv(.c) bool {
+    const self = Instance.get(plugin);
+    if (self.editor == null) return false;
+    ui.show(self.editor, false);
+    return true;
 }
 
 fn save(plugin: [*c]const c.clap_plugin_t, stream: [*c]const c.clap_ostream_t) callconv(.c) bool {
@@ -278,11 +420,29 @@ const note_ports: c.clap_plugin_note_ports_t = .{ .count = portCount, .get = not
 const audio_ports: c.clap_plugin_audio_ports_t = .{ .count = portCount, .get = audioPort };
 const params: c.clap_plugin_params_t = .{ .count = paramCount, .get_info = paramInfo, .get_value = paramValue, .value_to_text = valueText, .text_to_value = textValue, .flush = flush };
 const state: c.clap_plugin_state_t = .{ .save = save, .load = load };
+const gui: c.clap_plugin_gui_t = .{
+    .is_api_supported = guiSupported,
+    .get_preferred_api = guiPreferred,
+    .create = guiCreate,
+    .destroy = guiDestroy,
+    .set_scale = guiScale,
+    .get_size = guiSize,
+    .can_resize = guiResizable,
+    .get_resize_hints = guiHints,
+    .adjust_size = guiSize,
+    .set_size = guiSetSize,
+    .set_parent = guiParent,
+    .set_transient = guiTransient,
+    .suggest_title = guiTitle,
+    .show = guiShow,
+    .hide = guiHide,
+};
 fn extension(_: [*c]const c.clap_plugin_t, id: [*c]const u8) callconv(.c) ?*const anyopaque {
     if (same(id, "clap.note-ports")) return &note_ports;
     if (same(id, "clap.audio-ports")) return &audio_ports;
     if (same(id, "clap.params")) return &params;
     if (same(id, "clap.state")) return &state;
+    if (builtin.os.tag == .macos and same(id, "clap.gui")) return &gui;
     return null;
 }
 fn factoryCount(_: [*c]const c.clap_plugin_factory_t) callconv(.c) u32 {
@@ -295,7 +455,7 @@ fn create(_: [*c]const c.clap_plugin_factory_t, host: [*c]const c.clap_host_t, i
     if (!same(id, "dev.arpstick.basic") or host == null or host.*.clap_version.major != 1) return null;
     const self = std.heap.c_allocator.create(Instance) catch return null;
     self.* = .{
-        .plugin = .{ .desc = &descriptor, .plugin_data = self, .init = init, .destroy = destroy, .activate = activate, .deactivate = noOp, .start_processing = start, .stop_processing = noOp, .reset = reset, .process = process, .get_extension = extension, .on_main_thread = noOp },
+        .plugin = .{ .desc = &descriptor, .plugin_data = self, .init = init, .destroy = destroy, .activate = activate, .deactivate = noOp, .start_processing = start, .stop_processing = noOp, .reset = reset, .process = process, .get_extension = extension, .on_main_thread = onMainThread },
         .host = host,
         .values = .{ .init(engine.defaults[0]), .init(engine.defaults[1]), .init(engine.defaults[2]), .init(engine.defaults[3]) },
     };

@@ -10,6 +10,8 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     module.addIncludePath(b.path("vendor/clap/include"));
+    module.addIncludePath(b.path("src"));
+    if (target.result.os.tag == .macos) addNativeUI(b, module);
     const lib = b.addLibrary(.{ .name = "ArpStick", .linkage = .dynamic, .root_module = module });
     if (target.result.os.tag == .macos) {
         const install = b.addInstallFile(lib.getEmittedBin(), "ArpStick.clap/Contents/MacOS/ArpStick");
@@ -51,6 +53,20 @@ pub fn build(b: *std.Build) void {
         const run = b.addRunArtifact(host);
         run.addArtifactArg(lib);
         test_step.dependOn(&run.step);
+        if (target.result.os.tag == .macos) {
+            const gui_test = b.addExecutable(.{ .name = "clap-gui-test", .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }) });
+            gui_test.root_module.addIncludePath(b.path("vendor/clap/include"));
+            gui_test.root_module.addCSourceFile(.{ .file = b.path("tests/gui_host.m"), .flags = &.{ "-fobjc-arc", "-Wall", "-Wextra", "-Werror" } });
+            gui_test.root_module.linkFramework("Cocoa", .{});
+            gui_test.root_module.linkSystemLibrary("objc", .{});
+            const run_gui_test = b.addRunArtifact(gui_test);
+            run_gui_test.addArtifactArg(lib);
+            b.step("test-ui", "Check the actual CLAP editor in a small Cocoa host").dependOn(&run_gui_test.step);
+        }
     }
 }
 
