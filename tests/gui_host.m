@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+static uint32_t single_size(const clap_input_events_t *events);
+static const clap_event_header_t *single_get(const clap_input_events_t *events, uint32_t index);
 #define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "GUI FAIL line %d: %s\n", __LINE__, #condition); exit(1); } } while (0)
 static uint32_t flush_requests;
 static uint32_t callback_requests;
@@ -42,19 +44,20 @@ static bool output_push(const clap_output_events_t *events, const clap_event_hea
     }
     return true;
 }
-static NSControl *control(NSView *view, NSInteger id) {
-    for (NSView *child in view.subviews)
-        if (([child isKindOfClass:NSSegmentedControl.class] || [child isKindOfClass:NSPopUpButton.class]) && ((NSControl *)child).tag == id)
-            return (NSControl *)child;
-    return nil;
+
+typedef struct { uint8_t data[65536]; size_t position; } memory_t;
+static int64_t write_state(const clap_ostream_t *stream, const void *buffer, uint64_t size) {
+    memory_t *memory = stream->ctx;
+    if (memory->position + size > sizeof(memory->data)) return -1;
+    memcpy(memory->data + memory->position, buffer, size);
+    memory->position += size;
+    return (int64_t)size;
 }
-static void choose(NSView *view, NSInteger id, NSInteger value) {
-    NSControl *item = control(view, id);
-    CHECK(item != nil);
-    if ([item isKindOfClass:NSPopUpButton.class]) [(NSPopUpButton *)item selectItemAtIndex:value];
-    else ((NSSegmentedControl *)item).selectedSegment = value;
-    CHECK([item sendAction:item.action to:item.target]);
-}
+
+typedef void (*click_fn)(void *, double, double, uint32_t);
+typedef void (*size_fn)(void *, uint32_t, uint32_t);
+typedef void (*draw_fn)(void *);
+typedef void (*import_fn)(void *, const char *);
 
 int main(int argc, char **argv) {
     CHECK(argc == 2);
@@ -62,6 +65,14 @@ int main(int argc, char **argv) {
         [NSApplication sharedApplication];
         void *library = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
         CHECK(library != NULL);
+        click_fn click = (click_fn)dlsym(library, "arp_ui_click");
+        click_fn drag = (click_fn)dlsym(library, "arp_ui_drag");
+        click_fn release = (click_fn)dlsym(library, "arp_ui_release");
+        size_fn set_size = (size_fn)dlsym(library, "arp_ui_set_size");
+        draw_fn draw = (draw_fn)dlsym(library, "arp_ui_draw_now");
+        import_fn import_midi = (import_fn)dlsym(library, "arp_ui_import_midi");
+        CHECK(click && drag && release && set_size && draw && import_midi);
+
         const clap_plugin_entry_t *entry = dlsym(library, "clap_entry");
         CHECK(entry && entry->init(argv[1]));
         const clap_plugin_factory_t *factory = entry->get_factory(CLAP_PLUGIN_FACTORY_ID);
@@ -70,7 +81,8 @@ int main(int argc, char **argv) {
         CHECK(plugin && plugin->init(plugin));
         const clap_plugin_gui_t *gui = plugin->get_extension(plugin, CLAP_EXT_GUI);
         const clap_plugin_params_t *params = plugin->get_extension(plugin, CLAP_EXT_PARAMS);
-        CHECK(gui && params);
+        const clap_plugin_state_t *state = plugin->get_extension(plugin, CLAP_EXT_STATE);
+        CHECK(gui && params && state);
         const char *api = NULL; bool floating = true;
         CHECK(gui->get_preferred_api(plugin, &api, &floating) && !floating && !strcmp(api, "cocoa"));
         CHECK(!gui->is_api_supported(plugin, "win32", false));
@@ -79,20 +91,23 @@ int main(int argc, char **argv) {
         CHECK(gui->create(plugin, api, false));
         CHECK(!gui->create(plugin, api, false));
         uint32_t width = 0, height = 0;
-        CHECK(gui->get_size(plugin, &width, &height) && width == 480 && height == 340);
+        CHECK(gui->get_size(plugin, &width, &height) && width == 960 && height == 640);
         CHECK(!gui->can_resize(plugin) && !gui->set_size(plugin, 1, 1));
         NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
         clap_window_t parent = { .api = api, .cocoa = (__bridge void *)container };
         CHECK(gui->set_parent(plugin, &parent) && container.subviews.count == 1);
         CHECK(gui->show(plugin));
         NSView *view = container.subviews.firstObject;
-        CHECK(((NSSegmentedControl *)control(view, 0)).selectedSegment == 1);
-        choose(view, 0, 0);
+        CHECK(view.frame.size.width == 960 && view.frame.size.height == 640);
+        draw((__bridge void *)view);
+
+        // Click CHORD and verify a complete automation gesture survives a
+        // one-event output buffer, including the callback retry path.
+        click((__bridge void *)view, 328, 13, 0);
         CHECK(flush_requests == 1);
         clap_input_events_t input = { .size = input_size, .get = input_get };
         output_t recorded = { .budget = 1 };
         clap_output_events_t output = { .ctx = &recorded, .try_push = output_push };
-        // A one-event host buffer must still receive exactly one begin/value/end sequence.
         params->flush(plugin, &input, &output);
         CHECK(recorded.count == 1 && recorded.types[0] == CLAP_EVENT_PARAM_GESTURE_BEGIN);
         CHECK(callback_requests == 1);
@@ -107,41 +122,91 @@ int main(int argc, char **argv) {
         CHECK(recorded.count == 3 && recorded.types[2] == CLAP_EVENT_PARAM_GESTURE_END);
         double value = -1;
         CHECK(params->get_value(plugin, 0, &value) && value == 0);
-        choose(view, 1, 1); choose(view, 2, 2); choose(view, 3, 1);
-        recorded.budget = 100; params->flush(plugin, &input, &output);
-        CHECK(flush_requests == 6 && recorded.count == 12);
-        for (unsigned id = 0; id < 4; id++) {
-            CHECK(recorded.types[id * 3] == CLAP_EVENT_PARAM_GESTURE_BEGIN);
-            CHECK(recorded.types[id * 3 + 1] == CLAP_EVENT_PARAM_VALUE && recorded.ids[id * 3 + 1] == id);
-            CHECK(recorded.types[id * 3 + 2] == CLAP_EVENT_PARAM_GESTURE_END);
-        }
-        CHECK(params->get_value(plugin, 1, &value) && value == 1);
-        CHECK(params->get_value(plugin, 2, &value) && value == 2);
-        CHECK(params->get_value(plugin, 3, &value) && value == 1);
 
-        // Host automation flows back to the visible controls.
+        // Pattern letter, arp toggle, lane tab, grid drag, piano audition,
+        // constraint cycle, panic, menu and free-clock controls.
+        click((__bridge void *)view, 85, 43, 0);
+        click((__bridge void *)view, 663, 13, 0);
+        drag((__bridge void *)view, 663, 220, 0);
+        release((__bridge void *)view, 663, 220, 0);
+        click((__bridge void *)view, 418, 13, 0);
+        click((__bridge void *)view, 442, 36, 0);       // PITCH tab
+        draw((__bridge void *)view);
+        click((__bridge void *)view, 905, 55, 0);       // pitch degree 1
+        click((__bridge void *)view, 214, 36, 0);       // NOTE tab
+        click((__bridge void *)view, 199, 196, 0);      // first grid cell
+        drag((__bridge void *)view, 220, 220, 0);
+        release((__bridge void *)view, 220, 220, 0);
+        click((__bridge void *)view, 870, 55, 0);       // constraint C
+        click((__bridge void *)view, 923, 235, 0);      // panic
+        click((__bridge void *)view, 40, 482, 0);       // chord menu
+        click((__bridge void *)view, 20, 400, 0);       // first menu item
+        click((__bridge void *)view, 110, 482, 0);      // chord presets
+        click((__bridge void *)view, 20, 400, 0);       // C major diatonic bank
+        click((__bridge void *)view, 26, 299, 0);       // FREE clock
+        draw((__bridge void *)view);
+        recorded.budget = 100; params->flush(plugin, &input, &output);
+        CHECK(recorded.count > 3);
+        CHECK(params->get_value(plugin, 1, &value) && value == 0);
+        CHECK(params->get_value(plugin, 2, &value) && value == -36);
+        CHECK(params->get_value(plugin, 7, &value) && value == 1);
+
+        // Host automation reaches the shared parameter state.
         clap_event_param_value_t automation = { .header = { .size = sizeof(automation), .type = CLAP_EVENT_PARAM_VALUE },
-            .param_id = 1, .value = 2, .note_id = -1, .port_index = -1, .channel = -1, .key = -1 };
-        // Reuse an input list with a one-event accessor below.
-        extern uint32_t single_size(const clap_input_events_t *);
-        extern const clap_event_header_t *single_get(const clap_input_events_t *, uint32_t);
+            .param_id = 7, .value = 5, .note_id = -1, .port_index = -1, .channel = -1, .key = -1 };
         clap_input_events_t automated = { .ctx = &automation, .size = single_size, .get = single_get };
         params->flush(plugin, &automated, &output);
-        [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.07]];
-        CHECK(((NSPopUpButton *)control(view, 1)).indexOfSelectedItem == 2);
+        CHECK(params->get_value(plugin, 7, &value) && value == 5);
+        draw((__bridge void *)view);
+
+        // The preset bank written through the editor is visible in plugin state.
+        memory_t memory = {0};
+        clap_ostream_t ostream = { .ctx = &memory, .write = write_state };
+        CHECK(state->save(plugin, &ostream) && memory.position > 4000);
+        // magic(4) + version(2) + params(32) + curSlot(4) + watched(16) = 58
+        CHECK(memory.data[58 + 48 * 8] == 48);
+        CHECK(memory.data[58 + 48 * 8 + 1] == 52);
+        CHECK(memory.data[58 + 48 * 8 + 2] == 55);
+
+        // MIDI-file import writes chords into consecutive slots.
+        static const uint8_t smf[] = {
+            'M','T','h','d', 0,0,0,6, 0,0, 0,1, 1,0xe0,
+            'M','T','r','k', 0,0,0,0x1d,
+            0x00,0x90,60,100, 0x00,0x90,64,100, 0x00,0x90,67,100,
+            0x83,0x60,0x80,60,0, 0x00,0x80,64,0, 0x00,0x80,67,0,
+            0x00,0xff,0x2f,0x00,
+        };
+        FILE *midi_file = fopen("/tmp/arp-stick-gui-test.mid", "wb");
+        CHECK(midi_file != NULL);
+        CHECK(fwrite(smf, 1, sizeof(smf), midi_file) == sizeof(smf));
+        fclose(midi_file);
+        import_midi((__bridge void *)view, "/tmp/arp-stick-gui-test.mid");
+        memory.position = 0;
+        CHECK(state->save(plugin, &ostream));
+        CHECK(memory.data[58 + 48 * 8] == 60);
+        CHECK(memory.data[58 + 48 * 8 + 1] == 64);
+        CHECK(memory.data[58 + 48 * 8 + 2] == 67);
+        remove("/tmp/arp-stick-gui-test.mid");
+
+        // Layout scales without cropping.
+        set_size((__bridge void *)view, 480, 320);
+        draw((__bridge void *)view);
+        set_size((__bridge void *)view, 2304, 1536);
+        draw((__bridge void *)view);
+        set_size((__bridge void *)view, 960, 640);
+
         CHECK(gui->hide(plugin)); gui->destroy(plugin);
         CHECK(container.subviews.count == 0);
         CHECK(gui->create(plugin, api, false));
         CHECK(gui->set_parent(plugin, &parent));
-        CHECK(((NSPopUpButton *)control(container.subviews.firstObject, 1)).indexOfSelectedItem == 2);
+        draw((__bridge void *)container.subviews.firstObject);
         gui->destroy(plugin); plugin->destroy(plugin); entry->deinit();
-        // Cocoa keeps registered Objective-C classes for the lifetime of this process.
-        // The process exits here; do not explicitly dlclose its editor implementation.
-        puts("GUI test passed: Cocoa embedding, all controls, host automation, gesture backpressure, and editor recreation.");
+        puts("GUI test passed: 960x640 Cocoa editor, parameters, patterns, lanes, grid, piano, MIDI import, automation and scaling.");
     }
     return 0;
 }
-uint32_t single_size(const clap_input_events_t *events) { (void)events; return 1; }
-const clap_event_header_t *single_get(const clap_input_events_t *events, uint32_t index) {
-    return index == 0 ? events->ctx : NULL;
+
+static uint32_t single_size(const clap_input_events_t *events) { (void)events; return 1; }
+static const clap_event_header_t *single_get(const clap_input_events_t *events, uint32_t index) {
+    return index == 0 ? (const clap_event_header_t *)events->ctx : NULL;
 }
