@@ -851,3 +851,672 @@ pub const Engine = struct {
     }
 };
 
+test "factory chord preserves shared tones and applies transpose/locks" {
+    var m = Model.init();
+    var ui = m.clone();
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var rec = Recorder{};
+    const p: Params = .{ .chord_on = true, .arp_on = false };
+    e.sample_rate = 48000;
+    e.beginBlock(&m, &ui, &shared, p, .{}, rec.sink());
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 48, 100 }, 0);
+    _ = e.tick(&m, &shared, 0);
+    try std.testing.expectEqual(@as(usize, 3), rec.len);
+    try std.testing.expectEqual([3]u8{ 0x90, 48, 100 }, rec.events[0].data);
+    try std.testing.expectEqual([3]u8{ 0x90, 51, 100 }, rec.events[1].data);
+    try std.testing.expectEqual([3]u8{ 0x90, 55, 100 }, rec.events[2].data);
+    e.noteEvent(&m, &ui, &shared, .{ 0x80, 48, 0 }, 1);
+    _ = e.tick(&m, &shared, 1);
+    try std.testing.expectEqual(@as(usize, 6), rec.len);
+}
+
+test "velocity scaling, locks and transpose" {
+    var m = Model.init();
+    var ui = m.clone();
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var rec = Recorder{};
+    const p: Params = .{ .chord_on = true, .arp_on = false };
+    m.chord_vel[48] = .{ 200, 50, 100, 100, 100, 100, 100, 100 };
+    e.beginBlock(&m, &ui, &shared, p, .{}, rec.sink());
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 48, 64 }, 0);
+    try std.testing.expectEqual([3]u8{ 0x90, 48, 127 }, rec.events[0].data);
+    try std.testing.expectEqual([3]u8{ 0x90, 51, 32 }, rec.events[1].data);
+    try std.testing.expectEqual([3]u8{ 0x90, 55, 64 }, rec.events[2].data);
+    e.noteEvent(&m, &ui, &shared, .{ 0x80, 48, 0 }, 1);
+    _ = e.tick(&m, &shared, 1);
+
+    var rec2 = Recorder{};
+    m.lock_on = .{ false, true, false, false, false, false, false, false };
+    m.lock_note[1] = 40;
+    var p2 = p;
+    p2.transpose = 7;
+    e.beginBlock(&m, &ui, &shared, p2, .{}, rec2.sink());
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 48, 100 }, 0);
+    try std.testing.expectEqual([3]u8{ 0x90, 55, 127 }, rec2.events[0].data);
+    try std.testing.expectEqual([3]u8{ 0x90, 47, 50 }, rec2.events[1].data);
+    try std.testing.expectEqual([3]u8{ 0x90, 62, 100 }, rec2.events[2].data);
+}
+
+test "arp runs ascending 16ths with gate offs" {
+    var m = Model.init();
+    var ui = m.clone();
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var rec = Recorder{};
+    const p: Params = .{ .chord_on = false, .arp_on = true };
+    e.beginBlock(&m, &ui, &shared, p, .{ .playing = false, .tempo = 120, .beat = 0 }, rec.sink());
+    // Free clock (transport stopped) at 8 Hz: 6000 samples per step.
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 48, 100 }, 0);
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 52, 100 }, 0);
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 55, 100 }, 0);
+    var i: u32 = 0;
+    while (i < 24000) : (i += 1) _ = e.tick(&m, &shared, i);
+    try std.testing.expect(rec.len >= 4);
+    // 8 Hz free clock -> notes at 0, 6000, 12000, 18000.
+    try std.testing.expectEqual([3]u8{ 0x90, 48, 100 }, rec.events[0].data);
+    try std.testing.expectEqual(@as(u32, 0), rec.events[0].time);
+    var on48 = false;
+    var on52 = false;
+    var on55 = false;
+    for (rec.events[0..rec.len]) |ev| {
+        if (ev.data[0] == 0x90 and ev.data[1] == 48) on48 = true;
+        if (ev.data[0] == 0x90 and ev.data[1] == 52) on52 = true;
+        if (ev.data[0] == 0x90 and ev.data[1] == 55) on55 = true;
+    }
+    try std.testing.expect(on48 and on52 and on55);
+}
+
+test "constraint, octave and harmony" {
+    var m = Model.init();
+    m.patternDefaults(0);
+    m.graph[0][0][0] = 0; // lowest held note
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    e.params = .{ .chord_on = false, .arp_on = true };
+    e.pattern = 0;
+    e.arp_cnt = 1;
+    e.hel_b[0] = 60;
+    e.arp_root = 0;
+    e.last_in_vel = 100;
+    e.out_chan = 0;
+    e.now = 0;
+    e.L = 0.25;
+
+    var rec = Recorder{};
+    e.sink = rec.sink();
+    m.constraint[0] = 2; // C -> C#
+    e.arpFire(&m, &shared, 0);
+    var saw61 = false;
+    for (rec.events[0..rec.len]) |ev| {
+        if (ev.data[0] == 0x90 and ev.data[1] == 61) saw61 = true;
+    }
+    try std.testing.expect(saw61);
+
+    m.constraint[0] = 0;
+    e.snd_cnt = 0;
+    e.out_refs = @splat(@splat(0));
+    var rec2 = Recorder{};
+    e.sink = rec2.sink();
+    m.graph[2][0][0] = 1; // octave +1
+    e.arpFire(&m, &shared, 1);
+    try std.testing.expectEqual([3]u8{ 0x90, 72, 100 }, rec2.events[0].data);
+
+    e.snd_cnt = 0;
+    e.out_refs = @splat(@splat(0));
+    var rec3 = Recorder{};
+    e.sink = rec3.sink();
+    m.graph[2][0][0] = 0;
+    m.graph[7][0][0] = 7; // harmony +7
+    e.arpFire(&m, &shared, 2);
+    try std.testing.expectEqual([3]u8{ 0x90, 60, 100 }, rec3.events[0].data);
+    try std.testing.expectEqual([3]u8{ 0x90, 67, 100 }, rec3.events[1].data);
+}
+
+test "learn records a chord and advances" {
+    var m = Model.init();
+    var ui = m.clone();
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var rec = Recorder{};
+    const p: Params = .{ .chord_on = true, .arp_on = false };
+    shared.cur_slot.store(60, .release);
+    shared.learning.store(true, .release);
+    shared.learn_mode.store(1, .release);
+    e.beginBlock(&m, &ui, &shared, p, .{}, rec.sink());
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 60, 100 }, 0);
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 64, 100 }, 0);
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 67, 100 }, 0);
+    try std.testing.expectEqual(@as(usize, 3), shared.learn_count.load(.acquire));
+    e.noteEvent(&m, &ui, &shared, .{ 0x80, 60, 0 }, 1);
+    e.noteEvent(&m, &ui, &shared, .{ 0x80, 64, 0 }, 1);
+    e.noteEvent(&m, &ui, &shared, .{ 0x80, 67, 0 }, 1);
+    try std.testing.expectEqual(@as(i8, 60), ui.chord_notes[60][0]);
+    try std.testing.expectEqual(@as(i8, 64), ui.chord_notes[60][1]);
+    try std.testing.expectEqual(@as(i8, 67), ui.chord_notes[60][2]);
+    try std.testing.expectEqual(@as(i32, 61), shared.cur_slot.load(.acquire));
+}
+
+test "bank tools sort, transform and dedupe" {
+    var m = Model.init();
+    for (0..model.slots) |s| m.slotClear(s);
+    m.chord_notes[5] = @splat(-1);
+    m.chord_notes[5][0] = 60;
+    m.chord_notes[5][1] = 64;
+    m.chord_notes[5][2] = 67;
+    m.chord_notes[6] = @splat(-1);
+    m.chord_notes[6][0] = 40;
+    m.chord_notes[6][1] = 44;
+    m.chord_notes[6][2] = 47;
+    m.chord_notes[7] = @splat(-1);
+    m.chord_notes[7][0] = 50;
+    m.chord_notes[7][1] = 54;
+    m.chord_notes[7][2] = 57;
+    m.sortSlots(0);
+    try std.testing.expectEqual(@as(i8, 40), m.chord_notes[0][0]);
+    try std.testing.expectEqual(@as(i8, 50), m.chord_notes[1][0]);
+    try std.testing.expectEqual(@as(i8, 60), m.chord_notes[2][0]);
+
+    m.slotClear(30);
+    m.chord_notes[30][0] = 48;
+    m.chord_notes[30][1] = 52;
+    m.chord_notes[30][2] = 55;
+    m.makeThird(3);
+    try std.testing.expectEqual([3]i8{ 48, 51, 55 }, m.chord_notes[30][0..3].*);
+
+    for (0..model.slots) |s| m.slotClear(s);
+    m.chord_notes[40][0] = 48;
+    m.chord_notes[40][1] = 52;
+    m.chord_notes[40][2] = 55;
+    m.chord_notes[41][0] = 55;
+    m.chord_notes[41][1] = 52;
+    m.chord_notes[41][2] = 48;
+    m.chord_notes[42][0] = 60;
+    m.chord_notes[42][1] = 64;
+    m.removeDups();
+    var used: usize = 0;
+    for (0..model.slots) |s| {
+        if (m.used(s)) used += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), used);
+}
+
+test "panic and output channel routing" {
+    var m = Model.init();
+    var ui = m.clone();
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var rec = Recorder{};
+    const p: Params = .{ .chord_on = true, .arp_on = false, .out_channel = 6 };
+    e.beginBlock(&m, &ui, &shared, p, .{}, rec.sink());
+    e.noteEvent(&m, &ui, &shared, .{ 0x92, 48, 100 }, 0);
+    try std.testing.expectEqual(@as(u8, 0x95), rec.events[0].data[0]);
+    e.control(.{ 0xB2, 123, 0 });
+    e.beginBlock(&m, &ui, &shared, p, .{}, rec.sink());
+    for (rec.events[0..rec.len]) |ev| {
+        if (ev.data[0] == 0x80) try std.testing.expectEqual(@as(u8, 0x85), ev.data[0]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), e.act_cnt);
+}
+
+const Recorder = struct {
+    const Event = struct { time: u32, data: [3]u8 };
+    events: [512]Event = undefined,
+    len: usize = 0,
+    reject: bool = false,
+    fn push(context: *anyopaque, time: u32, data: [3]u8) bool {
+        const self: *Recorder = @ptrCast(@alignCast(context));
+        if (self.reject or self.len >= self.events.len) return false;
+        self.events[self.len] = .{ .time = time, .data = data };
+        self.len += 1;
+        return true;
+    }
+    fn sink(self: *Recorder) Sink {
+        return .{ .context = self, .push = push };
+    }
+};
+
+test "chord mode emits inversions per numbered step" {
+    var m = Model.init();
+    m.patternDefaults(0);
+    m.chord_mode[0] = true;
+    m.lane_len[0][0] = 3;
+    for (0..16) |i| m.graph[0][0][i] = -1;
+    m.graph[0][0][0] = 0;
+    m.graph[0][0][1] = 1;
+    m.graph[0][0][2] = 2;
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var rec = Recorder{};
+    e.sink = rec.sink();
+    e.params = .{ .chord_on = false, .arp_on = true };
+    e.pattern = 0;
+    e.arp_cnt = 3;
+    e.hel_b = @splat(0);
+    e.hel_b[0] = 48;
+    e.hel_b[1] = 52;
+    e.hel_b[2] = 55;
+    e.arp_root = 0;
+    e.last_in_vel = 100;
+    e.out_chan = 0;
+    e.now = 0;
+    e.L = 0.25;
+    e.lane_len = @splat(16);
+    e.lane_len[0] = 3;
+
+    e.arpFire(&m, &shared, 0);
+    try std.testing.expectEqual([3]i16{ 48, 52, 55 }, onsAt(&rec, 0));
+    const first = rec.len;
+    e.snd_cnt = 0;
+    e.out_refs = @splat(@splat(0));
+    e.arpFire(&m, &shared, 1);
+    try std.testing.expectEqual([3]i16{ 52, 55, 60 }, onsAt(&rec, first));
+    const second = rec.len;
+    e.snd_cnt = 0;
+    e.out_refs = @splat(@splat(0));
+    e.arpFire(&m, &shared, 2);
+    try std.testing.expectEqual([3]i16{ 55, 60, 64 }, onsAt(&rec, second));
+}
+
+test "gate, zero velocity and mute release tied notes" {
+    var m = Model.init();
+    m.patternDefaults(0);
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var scratch = Recorder{};
+    e.sink = scratch.sink();
+    e.params = .{ .chord_on = false, .arp_on = true };
+    e.pattern = 0;
+    e.arp_cnt = 1;
+    e.hel_b[0] = 60;
+    e.last_in_vel = 100;
+    e.L = 0.25;
+    e.now = 0;
+    e.lane_len = @splat(16);
+    m.graph[0][0][0] = 0;
+    m.graph[5][0][0] = 50;
+    e.arpFire(&m, &shared, 0);
+    try std.testing.expectEqual(@as(usize, 1), e.snd_cnt);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.125), e.snd_o[0], 0.0001);
+
+    m.graph[4][0][0] = 0;
+    e.snd_cnt = 0;
+    e.out_refs = @splat(@splat(0));
+    e.arpFire(&m, &shared, 0);
+    try std.testing.expectEqual(@as(usize, 0), e.snd_cnt);
+
+    m.graph[4][0][0] = 100;
+    m.graph[5][0][0] = 100;
+    e.arpFire(&m, &shared, 0);
+    try std.testing.expectEqual(@as(usize, 1), e.snd_cnt);
+    m.mute[0] = 1;
+    e.arpFire(&m, &shared, 0);
+    try std.testing.expectEqual(@as(usize, 0), e.snd_cnt);
+}
+
+test "down shape responds to reset arrows" {
+    var m = Model.init();
+    m.patternDefaults(0);
+    for (0..16) |i| m.graph[0][0][i] = 9;
+    m.reset[0][2] = true;
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var scratch = Recorder{};
+    e.sink = scratch.sink();
+    e.params = .{ .chord_on = false, .arp_on = true };
+    e.pattern = 0;
+    e.arp_cnt = 3;
+    e.hel_b = @splat(0);
+    e.hel_b[0] = 48;
+    e.hel_b[1] = 52;
+    e.hel_b[2] = 55;
+    e.last_in_vel = 100;
+    e.out_chan = 0;
+    e.now = 0;
+    e.L = 0.25;
+    e.lane_len = @splat(16);
+    var got: [4]i16 = undefined;
+    for (0..4) |i| {
+        e.arpFire(&m, &shared, @intCast(i));
+        got[i] = e.last_out_note;
+        e.snd_cnt = 0;
+        e.out_refs = @splat(@splat(0));
+    }
+    try std.testing.expectEqual([4]i16{ 55, 52, 55, 52 }, got);
+}
+
+test "directional shapes never leave the held chord" {
+    var m = Model.init();
+    m.patternDefaults(0);
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var scratch = Recorder{};
+    e.sink = scratch.sink();
+    e.params = .{ .chord_on = false, .arp_on = true };
+    e.pattern = 0;
+    e.arp_cnt = 3;
+    e.hel_b = @splat(0);
+    e.hel_b[0] = 48;
+    e.hel_b[1] = 52;
+    e.hel_b[2] = 55;
+    e.last_in_vel = 100;
+    e.out_chan = 0;
+    e.now = 0;
+    e.L = 0.25;
+    e.lane_len = @splat(16);
+    for (8..16) |shape| {
+        for (0..16) |i| m.graph[0][0][i] = @intCast(shape);
+        e.shape_pos = 0;
+        var step: i64 = 0;
+        while (step < 192) : (step += 1) {
+            e.arpFire(&m, &shared, step);
+            try std.testing.expect(e.last_out_note == 48 or e.last_out_note == 52 or e.last_out_note == 55);
+        }
+        e.snd_cnt = 0;
+        e.out_refs = @splat(@splat(0));
+    }
+}
+
+test "single-slot learn clamps to eight voices and does not advance" {
+    var m = Model.init();
+    var ui = m.clone();
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var rec = Recorder{};
+    e.sink = rec.sink();
+    const p: Params = .{ .chord_on = true, .arp_on = false };
+    shared.cur_slot.store(55, .release);
+    shared.learning.store(true, .release);
+    shared.learn_mode.store(3, .release);
+    e.beginBlock(&m, &ui, &shared, p, .{}, rec.sink());
+    var n: u8 = 48;
+    while (n < 60) : (n += 1) e.noteEvent(&m, &ui, &shared, .{ 0x90, n, 100 }, 0);
+    try std.testing.expectEqual(@as(u8, 8), shared.learn_count.load(.acquire));
+    n = 48;
+    while (n < 60) : (n += 1) e.noteEvent(&m, &ui, &shared, .{ 0x80, n, 0 }, 0);
+    try std.testing.expect(!shared.learning.load(.acquire));
+    try std.testing.expectEqual(@as(i32, 55), shared.cur_slot.load(.acquire));
+    try std.testing.expectEqual(@as(i8, 48), ui.chord_notes[55][0]);
+}
+
+test "pattern copy carries reset arrows, swing and lengths" {
+    var m = Model.init();
+    m.patternDefaults(0);
+    m.reset[0][0] = true;
+    m.swing[0] = 40;
+    m.link[0] = true;
+    m.lane_len[0][0] = 5;
+    m.copyPattern(0, 3);
+    try std.testing.expect(m.reset[3][0]);
+    try std.testing.expectEqual(@as(u8, 40), m.swing[3]);
+    try std.testing.expect(m.link[3]);
+    try std.testing.expectEqual(@as(u8, 5), m.lane_len[3][0]);
+}
+
+test "arp free clock continues while transport is stopped" {
+    var m = Model.init();
+    var ui = m.clone();
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var rec = Recorder{};
+    e.beginBlock(&m, &ui, &shared, .{ .chord_on = false, .arp_on = true }, .{ .playing = false }, rec.sink());
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 64, 100 }, 0);
+    var i: u32 = 0;
+    while (i < 12000) : (i += 1) _ = e.tick(&m, &shared, i);
+    var found = false;
+    for (rec.events[0..rec.len]) |ev| {
+        if (ev.data[0] == 0x90 and ev.data[1] == 64) found = true;
+    }
+    try std.testing.expect(found);
+    try std.testing.expect(e.last_fired >= 0);
+}
+
+fn onsAt(rec: *Recorder, start: usize) [3]i16 {
+    var result: [3]i16 = .{ -1, -1, -1 };
+    var n: usize = 0;
+    for (rec.events[start..rec.len]) |ev| {
+        if (ev.data[0] & 0xf0 == 0x90 and n < 3) {
+            result[n] = ev.data[1];
+            n += 1;
+        }
+    }
+    return result;
+}
+
+test "synced transport follows the beat timeline" {
+    var m = Model.init();
+    var ui = m.clone();
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var rec = Recorder{};
+    e.beginBlock(&m, &ui, &shared, .{ .chord_on = false, .arp_on = true }, .{ .playing = true, .tempo = 120, .beat = 0 }, rec.sink());
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 60, 100 }, 0);
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 52, 100 }, 0);
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 55, 100 }, 0);
+    var i: u32 = 0;
+    while (i < 24000) : (i += 1) _ = e.tick(&m, &shared, i);
+    var ons: [8]struct { time: u32, note: u8 } = undefined;
+    var count: usize = 0;
+    for (rec.events[0..rec.len]) |ev| {
+        if (ev.data[0] & 0xf0 == 0x90 and count < ons.len) {
+            ons[count] = .{ .time = ev.time, .note = ev.data[1] };
+            count += 1;
+        }
+    }
+    try std.testing.expect(count >= 4);
+    try std.testing.expectEqual(@as(u32, 0), ons[0].time);
+    try std.testing.expectEqual(@as(u8, 52), ons[0].note);
+    try std.testing.expectEqual(@as(u32, 6000), ons[1].time);
+    try std.testing.expectEqual(@as(u8, 55), ons[1].note);
+    try std.testing.expectEqual(@as(u32, 12000), ons[2].time);
+    try std.testing.expectEqual(@as(u8, 60), ons[2].note);
+    try std.testing.expectEqual(@as(u32, 18000), ons[3].time);
+}
+
+test "swing delays odd steps" {
+    var m = Model.init();
+    var ui = m.clone();
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var rec = Recorder{};
+    m.swing[0] = 50;
+    e.beginBlock(&m, &ui, &shared, .{ .chord_on = false, .arp_on = true }, .{ .playing = true, .tempo = 120, .beat = 0 }, rec.sink());
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 48, 100 }, 0);
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 52, 100 }, 0);
+    var i: u32 = 0;
+    while (i < 9500) : (i += 1) _ = e.tick(&m, &shared, i);
+    var second_on: ?u32 = null;
+    var seen: usize = 0;
+    for (rec.events[0..rec.len]) |ev| {
+        if (ev.data[0] & 0xf0 == 0x90) {
+            seen += 1;
+            if (seen == 2) second_on = ev.time;
+        }
+    }
+    try std.testing.expectEqual(@as(?u32, 9000), second_on);
+}
+
+test "lane divisions hold a step for several clock ticks" {
+    var m = Model.init();
+    m.patternDefaults(0);
+    m.lane_div[0][0] = 2;
+    m.graph[0][0][0] = 0;
+    m.graph[0][0][1] = 1;
+    m.graph[0][0][2] = 2;
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var scratch = Recorder{};
+    e.sink = scratch.sink();
+    e.params = .{ .chord_on = false, .arp_on = true };
+    e.pattern = 0;
+    e.arp_cnt = 3;
+    e.hel_b[0] = 48;
+    e.hel_b[1] = 52;
+    e.hel_b[2] = 55;
+    e.last_in_vel = 100;
+    e.out_chan = 0;
+    e.now = 0;
+    e.L = 0.25;
+    e.lane_len = @splat(16);
+    var got: [3]i16 = undefined;
+    for (0..3) |i| {
+        e.arpFire(&m, &shared, @intCast(i));
+        got[i] = e.last_out_note;
+        e.snd_cnt = 0;
+        e.out_refs = @splat(@splat(0));
+    }
+    try std.testing.expectEqual([3]i16{ 48, 48, 52 }, got);
+}
+
+test "chord presets build diatonic banks" {
+    var m = Model.init();
+    m.applyChordPreset(0); // C major triads on every key
+    try std.testing.expectEqual([3]i8{ 48, 52, 55 }, m.chord_notes[48][0..3].*);
+    try std.testing.expectEqual([3]i8{ 50, 53, 57 }, m.chord_notes[50][0..3].*);
+    try std.testing.expectEqual([3]i8{ 55, 59, 62 }, m.chord_notes[55][0..3].*);
+    try std.testing.expectEqual([3]i8{ 59, 62, 65 }, m.chord_notes[59][0..3].*);
+    m.applyChordPreset(28); // C major diatonic sevenths
+    try std.testing.expectEqual([4]i8{ 48, 52, 55, 59 }, m.chord_notes[48][0..4].*);
+    m.applyChordPreset(27); // I-V-vi-IV
+    try std.testing.expectEqual([3]i8{ 48, 52, 55 }, m.chord_notes[48][0..3].*);
+    try std.testing.expectEqual([3]i8{ 55, 59, 62 }, m.chord_notes[55][0..3].*);
+    try std.testing.expectEqual([3]i8{ 57, 60, 64 }, m.chord_notes[57][0..3].*);
+    try std.testing.expectEqual([3]i8{ 53, 57, 60 }, m.chord_notes[53][0..3].*);
+}
+
+test "slot transforms follow the constraint map" {
+    var m = Model.init();
+    for (0..model.slots) |s| m.slotClear(s);
+    m.chord_notes[10][0] = 60; // C
+    m.chord_notes[10][1] = 64; // E
+    m.chord_notes[10][2] = 67; // G
+    m.constraint[0] = 1; // block C
+    m.transformPrevent();
+    try std.testing.expectEqual(@as(i8, -1), m.chord_notes[10][0]);
+    m.constraint[0] = 2; // C up to C#
+    m.slotClear(10);
+    m.chord_notes[10][0] = 60;
+    m.transformPrevent();
+    try std.testing.expectEqual(@as(i8, 61), m.chord_notes[10][0]);
+
+    // Match the selected chord's pitch classes across the bank.
+    for (0..model.slots) |s| m.slotClear(s);
+    m.chord_notes[20][0] = 60;
+    m.chord_notes[20][1] = 64;
+    m.chord_notes[20][2] = 67;
+    m.chord_notes[30][0] = 62;
+    m.chord_notes[30][1] = 66;
+    m.chord_notes[30][2] = 69;
+    m.transformMatch(20);
+    try std.testing.expectEqual([3]i8{ 60, 64, 67 }, m.chord_notes[30][0..3].*);
+}
+
+test "populate empty and remove-by-count compact the bank" {
+    var m = Model.init();
+    for (0..model.slots) |s| m.slotClear(s);
+    m.chord_notes[40][0] = 48;
+    m.chord_notes[40][1] = 52;
+    m.chord_notes[40][2] = 55;
+    m.populateEmpty();
+    try std.testing.expectEqual(@as(i8, 49), m.chord_notes[41][0]);
+    try std.testing.expectEqual(@as(i8, 53), m.chord_notes[41][1]);
+    try std.testing.expectEqual(@as(i8, 56), m.chord_notes[41][2]);
+    m.removeNNotes(3);
+    var used: usize = 0;
+    for (0..model.slots) |s| {
+        if (m.used(s)) used += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), used);
+}
+
+test "chord module feeds the arp with generated notes" {
+    var m = Model.init();
+    var ui = m.clone();
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var rec = Recorder{};
+    e.beginBlock(&m, &ui, &shared, .{ .chord_on = true, .arp_on = true }, .{ .playing = false }, rec.sink());
+    e.noteEvent(&m, &ui, &shared, .{ 0x90, 60, 100 }, 0);
+    _ = e.tick(&m, &shared, 0);
+    try std.testing.expectEqual(@as(usize, 3), e.arp_cnt);
+    try std.testing.expectEqual([3]u8{ 60, 63, 67 }, e.hel_b[0..3].*);
+    try std.testing.expect(e.last_out_note == 60);
+}
+
+test "bypass passes notes through with channel and velocity" {
+    var m = Model.init();
+    var ui = m.clone();
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var rec = Recorder{};
+    e.beginBlock(&m, &ui, &shared, .{ .chord_on = false, .arp_on = false }, .{}, rec.sink());
+    e.noteEvent(&m, &ui, &shared, .{ 0x95, 72, 55 }, 0);
+    try std.testing.expectEqual([3]u8{ 0x95, 72, 55 }, rec.events[0].data);
+    e.noteEvent(&m, &ui, &shared, .{ 0x85, 72, 0 }, 1);
+    try std.testing.expectEqual([3]u8{ 0x85, 72, 0 }, rec.events[1].data);
+}
+
+test "arp honours the fixed output channel" {
+    var m = Model.init();
+    var ui = m.clone();
+    var shared = Shared.init();
+    var e = Engine.init(48000);
+    var rec = Recorder{};
+    e.beginBlock(&m, &ui, &shared, .{ .chord_on = false, .arp_on = true, .out_channel = 10 }, .{ .playing = false }, rec.sink());
+    e.noteEvent(&m, &ui, &shared, .{ 0x92, 64, 100 }, 0);
+    _ = e.tick(&m, &shared, 0);
+    try std.testing.expectEqual(@as(u8, 0x99), rec.events[0].data[0]);
+}
+
+test "chord names follow the JSFX vocabulary" {
+    var m = Model.init();
+    var buf: [64]u8 = undefined;
+    m.slotClear(48);
+    m.chord_notes[48][0] = 48;
+    m.chord_notes[48][1] = 52;
+    m.chord_notes[48][2] = 55;
+    try std.testing.expectEqualStrings("C maj", model.chordName(&m, 48, &buf));
+    m.chord_notes[48][1] = 51;
+    try std.testing.expectEqualStrings("C min", model.chordName(&m, 48, &buf));
+    m.chord_notes[48][3] = 59;
+    try std.testing.expectEqualStrings("C minmaj7", model.chordName(&m, 48, &buf));
+    m.slotClear(60);
+    try std.testing.expectEqualStrings("-- empty --", model.chordName(&m, 60, &buf));
+}
+
+test "minor and progression chord presets" {
+    var m = Model.init();
+    m.applyChordPreset(23); // A natural minor triads
+    try std.testing.expectEqual([3]i8{ 57, 60, 64 }, m.chord_notes[57][0..3].*);
+    m.applyChordPreset(41); // Am i-VI-III-VII
+    try std.testing.expectEqual([3]i8{ 57, 60, 64 }, m.chord_notes[57][0..3].*);
+    try std.testing.expectEqual([3]i8{ 53, 57, 60 }, m.chord_notes[53][0..3].*);
+    try std.testing.expectEqual([3]i8{ 48, 52, 55 }, m.chord_notes[48][0..3].*);
+    try std.testing.expectEqual([3]i8{ 55, 59, 62 }, m.chord_notes[55][0..3].*);
+    m.applyChordPreset(55); // G I-vi-IV-V
+    try std.testing.expectEqual([3]i8{ 55, 59, 62 }, m.chord_notes[55][0..3].*);
+    try std.testing.expectEqual([3]i8{ 52, 55, 59 }, m.chord_notes[52][0..3].*);
+}
+
+test "arp presets and graph clipboard" {
+    var m = Model.init();
+    var rng = std.Random.DefaultPrng.init(1);
+    m.applyArpPreset(0, 0, &rng);
+    for (0..16) |i| try std.testing.expectEqual(@as(i16, 8), m.graph[0][0][i]);
+    m.applyArpPreset(0, 1, &rng);
+    for (0..16) |i| try std.testing.expectEqual(@as(i16, 9), m.graph[0][0][i]);
+    m.applyArpPreset(0, 8, &rng);
+    try std.testing.expectEqual(@as(i16, 8), m.graph[0][0][0]);
+    try std.testing.expectEqual(@as(i16, 1), m.graph[2][0][4]);
+    try std.testing.expectEqual(@as(i16, 2), m.graph[2][0][8]);
+
+    m.reset[0][3] = true;
+    m.lane_len[0][0] = 7;
+    m.graphCopy(0, 0);
+    m.reset[0][3] = false;
+    m.lane_len[0][0] = 16;
+    m.graphPaste(0, 0);
+    try std.testing.expect(m.reset[0][3]);
+    try std.testing.expectEqual(@as(u8, 7), m.lane_len[0][0]);
+}
