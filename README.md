@@ -88,3 +88,60 @@ Or load `examples/setup-demo.lua` through **Actions → Show action list → New
 
 Arp Stick produces MIDI and passes existing stereo audio through. It needs a downstream instrument to make sound. The original root notes are replaced with generated notes; do not enable an additional dry MIDI path around the effect.
 
+## Parameters
+
+The eight CLAP parameters match the JSFX sliders in order:
+
+1. **Chord Module** — Off/On.
+2. **Arp Module** — Off/On.
+3. **Chord Transpose** — −36…+36.
+4. **MIDI Latch** — Off/On.
+5. **Test Tone** — 0–100%.
+6. **Output Channel** — Input or 1–16.
+7. **MIDI Remote** — Off/On.
+8. **Pattern** — A–L.
+
+All are stepped, automatable, host-visible, and saved in project state. The detailed chord/pattern data is saved through CLAP state as well.
+
+## MIDI remote
+
+With **MIDI Remote** enabled:
+
+- **Channel 3** CC 0–11 selects pattern A–L.
+- **Channel 2** CC 0–15 sets the current graph lane step (the CC value is mapped through the visible lane's vertical scale).
+- **Channel 2** CC 101–108 sets chord-voice notes 1–8 in the current slot.
+
+This matches the JSFX remote mapping.
+
+## Checks and code
+
+```sh
+zig build test
+```
+
+Runs 26 Zig engine tests plus a C test host that loads the actual shared library through the CLAP ABI. Coverage includes chord overlap, velocity scaling, locks, transpose, arp timing on both the host beat timeline and the free clock, swing, lane divisions, chord mode, gates/ties, constraints, octave, harmony, shape/reset behavior, learn modes, bank transforms/presets, panic, output-channel routing, MIDI remote, test tone, latch, audio passthrough, CC forwarding, and full state round-trip with short stream reads/writes.
+
+```sh
+zig build test-ui
+```
+
+Checks the actual CLAP editor in a small Cocoa host: 960 × 640 sizing, embedding, parameter gestures and backpressure, pattern/lane/grid/piano interaction, negative transpose, menus/presets, automation back to shared state, and scaling without cropping.
+
+Code layout:
+
+- `src/model.zig` — chord bank, pattern data, scales, presets, transforms, chord names.
+- `src/engine.zig` — sample-accurate MIDI engine and timing.
+- `src/plugin.zig` — CLAP adapter, 8 parameters, state, audio passthrough, MIDI remote.
+- `src/ui/macos.m` — shared native editor.
+- `src/preview.zig` — standalone editor preview backend.
+
+Processing uses fixed arrays and performs no heap allocation or locking. The engine and CLAP adapter are Zig; the macOS editor uses an Objective-C bridge to Cocoa. UI edits are published to audio through a versioned snapshot; AppKit is never called from audio processing.
+
+## Differences from the JSFX version
+
+- Arp Stick is a CLAP plugin rather than a REAPER JSFX. It works in any CLAP host.
+- The JSFX's REAPER `gmem` MIDI-buffer import is replaced by direct Standard MIDI File import in the editor.
+- The editor is Cocoa rather than REAPER's `gfx_*` canvas. The layout, vocabulary and interaction model follow the JSFX panel.
+- Host generic parameter UIs are used on non-macOS platforms.
+
+Upstream CLAP headers and their MIT license are in `vendor/clap/`. See its README for the pinned version and include-guard compatibility patch.
