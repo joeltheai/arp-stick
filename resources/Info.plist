@@ -5,6 +5,6 @@
   <key>CFBundleIdentifier</key><string>dev.arpstick.clap</string>
   <key>CFBundleName</key><string>Arp Stick</string>
   <key>CFBundlePackageType</key><string>BNDL</string>
-  <key>CFBundleVersion</key><string>0.1.0</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key><string>0.2.0</string>
+  <key>CFBundleShortVersionString</key><string>0.2.0</string>
 </dict></plist>
