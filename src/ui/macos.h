@@ -97,3 +97,11 @@ void arp_ui_show(void *handle, bool visible);
 void arp_ui_refresh(void *handle);
 int arp_ui_preview(const ArpStickUIConfig *config);
 
+// Test hooks used by tests/gui_host.m.
+void arp_ui_set_size(void *handle, uint32_t width, uint32_t height);
+void arp_ui_click(void *handle, double x, double y, uint32_t modifiers);
+void arp_ui_drag(void *handle, double x, double y, uint32_t modifiers);
+void arp_ui_release(void *handle, double x, double y, uint32_t modifiers);
+void arp_ui_key(void *handle, uint32_t key);
+void arp_ui_draw_now(void *handle);
+void arp_ui_import_midi(void *handle, const char *path);
